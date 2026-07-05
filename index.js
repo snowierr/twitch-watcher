@@ -67,7 +67,7 @@ async function checkChannel(page, login) {
                         html.toLowerCase().includes(SUSPENSION_TEXT);
 
     console.log(`[${login}] suspended:${isSuspended} integrity_ok:${integrityOk} gql:${gqlResponses.length}`);
-    return { ok: true, isSuspended };
+    return { ok: true, isSuspended, integrityOk };
   } catch (e) {
     console.error(`[${login}] error: ${e.message}`);
     return { ok: false, isSuspended: false };
@@ -103,6 +103,14 @@ async function runCheck(sessionFile) {
     for (const login of LOGINS) {
       const result = await checkChannel(page, login);
       if (!result.ok) continue;
+
+      // Если integrity check упал — результат ненадёжен, не меняем статус
+      // иначе получим ложное "suspension снят" когда сессия сбросилась
+      if (!result.integrityOk) {
+        console.log(`[${login}] integrity failed — статус не трогаем (был: ${state[login] || 'ok'})`);
+        continue;
+      }
+
       const prev = state[login] || 'ok';
       const next = result.isSuspended ? 'suspended' : 'ok';
       if (prev !== 'suspended' && next === 'suspended') {
