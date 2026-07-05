@@ -8,6 +8,9 @@ const INTERVAL_MS = (Number(process.env.CHECK_INTERVAL_MIN) || 1) * 60 * 1000;
 const STATE_FILE = '/tmp/twitch_status.json';
 const SUSPENSION_CLASS = 'home-carousel-info--suspended';
 
+// Режим диагностики — только для drakeoffc, разово
+const DIAG_LOGIN = process.env.DIAG_LOGIN || '';
+
 function loadState() {
   try { return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); } catch (e) { return {}; }
 }
@@ -25,7 +28,23 @@ async function sendTelegram(text) {
   }
 }
 
+// Рекурсивно ищем в JSON-объекте ключи содержащие паттерн
+function deepSearch(obj, pattern, path = '', results = []) {
+  if (!obj || typeof obj !== 'object') return results;
+  for (const [k, v] of Object.entries(obj)) {
+    const p = path ? `${path}.${k}` : k;
+    if (pattern.test(k) || (typeof v === 'string' && pattern.test(v))) {
+      results.push(`${p}: ${JSON.stringify(v).substring(0, 120)}`);
+    }
+    if (typeof v === 'object') deepSearch(v, pattern, p, results);
+  }
+  return results;
+}
+
 async function checkChannel(page, login) {
+  const isDiag = login === DIAG_LOGIN;
+  const gqlResponses = [];
+
   try {
     await page.addInitScript(() => {
       ['TwitchBrowserConsent','cookiesConsent','consent-banner','cookieConsent'].forEach(k => {
@@ -33,34 +52,50 @@ async function checkChannel(page, login) {
       });
     });
 
+    // Перехватываем GQL ответы
+    page.on('response', async (resp) => {
+      if (!resp.url().includes('gql.twitch.tv')) return;
+      try {
+        const json = await resp.json();
+        gqlResponses.push(json);
+      } catch (e) {}
+    });
+
     await page.goto(`https://www.twitch.tv/${login}`, {
       waitUntil: 'domcontentloaded', timeout: 30000
     });
 
-    // Закрываем куки-баннер если появился
     await page.evaluate(() => {
       document.querySelectorAll('button').forEach(btn => {
         if (/decline|reject|accept/i.test(btn.textContent || '')) btn.click();
       });
     });
 
-    // Ждём пока React получит GQL-ответ и добавит модификатор к home-carousel-info.
-    // Именно в этот момент появляется --suspended, --offline или --live.
-    // Таймаут 20 сек — если за это время не появилось, значит страница застряла.
-    const settled = await page.waitForFunction(
-      () => document.documentElement.innerHTML.includes('home-carousel-info--'),
-      { timeout: 20000 }
-    ).then(() => true).catch(() => false);
+    // Ждём GQL-ответов — не ждём settled, просто даём время
+    await page.waitForTimeout(12000);
 
     const html = await page.content();
     const isSuspended = html.includes(SUSPENSION_CLASS);
 
-    console.log(`[${login}] settled:${settled} suspended:${isSuspended} (${html.length} chars)`);
+    console.log(`[${login}] suspended:${isSuspended} gql_responses:${gqlResponses.length} html:${html.length}`);
 
-    // Диагностика для drakeoffc — показываем что именно внутри home-carousel-info
-    if (login === 'drakeoffc') {
-      const idx = html.indexOf('home-carousel-info');
-      if (idx !== -1) console.log(`[drakeoffc] carousel snippet: "${html.substring(idx, idx + 150)}"`);
+    // Диагностика: ищем в GQL-ответах всё связанное с суспендом/стримингом
+    if (isDiag) {
+      const pattern = /suspend|ban|stream|enforce|restrict|cannot|offline|carousel/i;
+      const found = [];
+      gqlResponses.forEach((resp, i) => {
+        const hits = deepSearch(resp, pattern);
+        if (hits.length) {
+          found.push(`=== Response #${i} ===`);
+          found.push(...hits.slice(0, 10)); // max 10 хитов на ответ
+        }
+      });
+      if (found.length) {
+        console.log(`[DIAG ${login}] Found ${found.length} items:`);
+        found.slice(0, 50).forEach(l => console.log(`  ${l}`));
+      } else {
+        console.log(`[DIAG ${login}] Nothing found in ${gqlResponses.length} GQL responses`);
+      }
     }
 
     return { ok: true, isSuspended };
@@ -95,15 +130,13 @@ async function runCheck() {
       const prev = state[login] || 'ok';
       const next = result.isSuspended ? 'suspended' : 'ok';
       if (prev !== 'suspended' && next === 'suspended') {
-        console.log(`[${login}] 🚫 SUSPENSION DETECTED`);
-        await sendTelegram(`🚫 <b>${login}</b> — streaming suspension!\ntwitch.tv/${login} — канал виден, но не может стримить.\nВремя: ${new Date().toLocaleString('ru-RU')}`);
+        await sendTelegram(`🚫 <b>${login}</b> — streaming suspension!\ntwitch.tv/${login}\nВремя: ${new Date().toLocaleString('ru-RU')}`);
         state[login] = 'suspended'; saveState(state);
       } else if (prev === 'suspended' && next === 'ok') {
-        console.log(`[${login}] ✅ suspension lifted`);
         await sendTelegram(`✅ <b>${login}</b> — suspension снят!\nВремя: ${new Date().toLocaleString('ru-RU')}`);
         state[login] = 'ok'; saveState(state);
       }
-      await page.waitForTimeout(1000);
+      await page.waitForTimeout(500);
     }
     await context.close().catch(() => {});
   } catch (e) { console.error('[browser]', e.message); }
