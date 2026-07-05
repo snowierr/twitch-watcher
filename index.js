@@ -1,13 +1,3 @@
-/**
- * twitch-watcher — Railway сервис для детекта streaming suspension на Twitch
- *
- * ENV-переменные (Railway Dashboard → Variables):
- *   TWITCH_LOGINS       — логины через запятую: drakeoffc,5opka,mellsher
- *   TELEGRAM_BOT_TOKEN  — токен бота
- *   TELEGRAM_CHAT_IDS   — chat_id через запятую
- *   CHECK_INTERVAL_MIN  — интервал в минутах (по умолчанию 1)
- */
-
 const { chromium } = require('playwright');
 const fs = require('fs');
 
@@ -17,11 +7,8 @@ const CHAT_IDS = (process.env.TELEGRAM_CHAT_IDS || '').split(',').map(s => s.tri
 const INTERVAL_MS = (Number(process.env.CHECK_INTERVAL_MIN) || 1) * 60 * 1000;
 const STATE_FILE = '/tmp/twitch_status.json';
 
-const SUSPENSION_PHRASES = [
-  'cannot stream at this time',
-  'violation of twitch',
-  'community guidelines',           // на странице суспенда всегда есть
-];
+// Единственная уникальная фраза из баннера суспенда
+const SUSPENSION_PHRASE = 'cannot stream at this time';
 
 function loadState() {
   try { return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); }
@@ -29,7 +16,7 @@ function loadState() {
 }
 function saveState(state) {
   try { fs.writeFileSync(STATE_FILE, JSON.stringify(state), 'utf8'); }
-  catch (e) { console.error('[state] save failed:', e.message); }
+  catch (e) {}
 }
 
 async function sendTelegram(text) {
@@ -41,34 +28,33 @@ async function sendTelegram(text) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'HTML' })
       });
-    } catch (e) { console.error('[telegram] error:', e.message); }
+    } catch (e) { console.error('[telegram]', e.message); }
   }
 }
 
 async function checkChannel(page, login) {
   try {
-    // Патчим navigator.webdriver чтобы Twitch не детектировал автоматизацию
-    await page.addInitScript(() => {
-      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-      delete navigator.__proto__.webdriver;
-    });
-
-    // Грузим страницу, ждём пока не установится network idle (все XHR/fetch завершатся)
     await page.goto(`https://www.twitch.tv/${login}`, {
-      waitUntil: 'networkidle',
-      timeout: 45000
+      waitUntil: 'domcontentloaded',
+      timeout: 30000
     });
 
-    // Дополнительная пауза — React может рендерить после последнего сетевого запроса
-    await page.waitForTimeout(3000);
+    // Ждём пока React отрендерит контент — проверяем что тело выросло до нормального размера
+    await page.waitForFunction(
+      () => document.body.innerText.length > 3000,
+      { timeout: 20000 }
+    ).catch(() => {});
+
+    // Дополнительные 2 секунды на асинхронные компоненты
+    await page.waitForTimeout(2000);
 
     const bodyText = (await page.textContent('body')).toLowerCase();
 
-    // Считаем совпадения — если все три фразы есть одновременно, это страница суспенда
-    const hits = SUSPENSION_PHRASES.filter(p => bodyText.includes(p));
-    const isSuspended = hits.length >= 2; // минимум 2 из 3 чтобы не было ложных срабатываний
+    // ДИАГНОСТИКА: показываем первые 300 символов чтобы понять что реально приходит
+    console.log(`[${login}] body preview: "${bodyText.substring(0, 300).replace(/\s+/g, ' ')}"`);
 
-    console.log(`[${login}] phrases found: ${hits.length}/3 — ${isSuspended ? 'SUSPENDED' : 'ok'}`);
+    const isSuspended = bodyText.includes(SUSPENSION_PHRASE);
+    console.log(`[${login}] suspended: ${isSuspended} (body length: ${bodyText.length})`);
     return { ok: true, isSuspended };
 
   } catch (e) {
@@ -91,7 +77,6 @@ async function runCheck() {
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
         '--disable-blink-features=AutomationControlled',
-        '--disable-infobars',
         '--window-size=1280,800'
       ]
     });
@@ -100,8 +85,12 @@ async function runCheck() {
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
       locale: 'en-US',
       viewport: { width: 1280, height: 800 },
-      // Эмулируем нормальный браузер — принимаем куки, JS и т.д.
-      javaScriptEnabled: true,
+    });
+
+    // Скрываем признаки автоматизации
+    await context.addInitScript(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+      window.chrome = { runtime: {} };
     });
 
     const page = await context.newPage();
@@ -114,7 +103,7 @@ async function runCheck() {
       const newStatus = result.isSuspended ? 'suspended' : 'ok';
 
       if (prevStatus !== 'suspended' && newStatus === 'suspended') {
-        console.log(`[${login}] 🚫 NEW SUSPENSION DETECTED`);
+        console.log(`[${login}] 🚫 SUSPENSION DETECTED`);
         await sendTelegram(
           `🚫 <b>${login}</b> — streaming suspension!\n` +
           `twitch.tv/${login} — канал виден, но не может вести трансляции.\n` +
@@ -133,14 +122,13 @@ async function runCheck() {
         saveState(state);
       }
 
-      // Пауза между каналами
-      await page.waitForTimeout(1500);
+      await page.waitForTimeout(1000);
     }
 
-    await context.close();
+    await context.close().catch(() => {});
   } catch (e) {
-    console.error('[browser] critical error:', e.message);
-    await sendTelegram(`⚠️ twitch-watcher: ошибка браузера — ${e.message}`);
+    // Не шлём алерт в телеграм при обычной ошибке браузера — просто логируем
+    console.error('[browser] error:', e.message);
   } finally {
     if (browser) await browser.close().catch(() => {});
   }
