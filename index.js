@@ -6,7 +6,9 @@ const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const CHAT_IDS = (process.env.TELEGRAM_CHAT_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
 const INTERVAL_MS = (Number(process.env.CHECK_INTERVAL_MIN) || 1) * 60 * 1000;
 const STATE_FILE = '/tmp/twitch_status.json';
-const SUSPENSION_PHRASE = 'cannot stream at this time';
+
+const SUSPENSION_CLASS = 'home-carousel-info--suspended';
+const SUSPENSION_TEXT  = 'cannot stream at this time';
 
 function loadState() {
   try { return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); }
@@ -30,78 +32,45 @@ async function sendTelegram(text) {
   }
 }
 
-// Закрываем баннер куки — пробуем несколько вариантов кнопок
-async function dismissCookieBanner(page) {
-  const selectors = [
-    'button[data-a-target="consent-banner-accept"]',
-    'button[data-a-target="consent-banner-decline"]',
-    'button:has-text("Accept")',
-    'button:has-text("Decline")',
-    'button:has-text("Reject")',
-  ];
-  for (const sel of selectors) {
-    try {
-      const btn = await page.$(sel);
-      if (btn) {
-        await btn.click();
-        console.log(`[cookie] dismissed via: ${sel}`);
-        return true;
-      }
-    } catch (e) {}
-  }
-  return false;
-}
-
 async function checkChannel(page, login) {
   try {
-    // Перехватываем GQL-ответы — это запасной способ обнаружить суспенд
-    const gqlTexts = [];
-    const onResponse = async (response) => {
-      if (response.url().includes('gql.twitch.tv')) {
-        try {
-          const text = await response.text();
-          gqlTexts.push(text);
-        } catch (e) {}
-      }
-    };
-    page.on('response', onResponse);
+    // Устанавливаем localStorage ДО навигации, чтобы скрипт согласия
+    // нашёл флаги уже при первом запуске и не блокировал основной JS Twitch
+    await page.addInitScript(() => {
+      const keys = [
+        'TwitchBrowserConsent',
+        'cookiesConsent',
+        'consent-banner',
+        'twitch-cookie-consent',
+        'cookieConsent'
+      ];
+      const value = JSON.stringify({ analytics: true, ads: true, accepted: true, date: Date.now() });
+      keys.forEach(k => { try { localStorage.setItem(k, value); } catch(e) {} });
+    });
 
     await page.goto(`https://www.twitch.tv/${login}`, {
       waitUntil: 'domcontentloaded',
       timeout: 30000
     });
 
-    // Пробуем закрыть баннер куки
-    const dismissed = await dismissCookieBanner(page);
-    if (dismissed) {
-      // После закрытия баннера ждём загрузки реального контента
-      await page.waitForTimeout(5000);
-    } else {
-      await page.waitForTimeout(3000);
-    }
+    // Если баннер всё равно появился — кликаем по любой его кнопке
+    await page.evaluate(() => {
+      document.querySelectorAll('button').forEach(btn => {
+        if (/decline|reject|opt.?out|accept/i.test(btn.textContent || '')) btn.click();
+      });
+    });
 
-    // innerText — только видимый текст, без скриптов и стилей
-    const visibleText = await page.evaluate(() => document.body.innerText).catch(() => '');
-    const visibleLower = visibleText.toLowerCase();
+    // Ждём рендеринга React-компонентов
+    await page.waitForTimeout(6000);
 
-    // Также проверяем все GQL-ответы на случай если текст не попал в DOM
-    const allGql = gqlTexts.join(' ').toLowerCase();
+    // page.content() = полный HTML включая всё что React добавил в DOM
+    const html = await page.content();
 
-    page.off('response', onResponse);
+    const hasClass = html.includes(SUSPENSION_CLASS);
+    const hasText  = html.toLowerCase().includes(SUSPENSION_TEXT);
+    const isSuspended = hasClass || hasText;
 
-    // Диагностика
-    console.log(`[${login}] visible text (first 300): "${visibleLower.substring(0, 300).replace(/\s+/g, ' ')}"`);
-    console.log(`[${login}] GQL responses: ${gqlTexts.length}, total chars: ${allGql.length}`);
-    if (allGql.includes('suspend') || allGql.includes('cannot stream')) {
-      console.log(`[${login}] GQL preview: "${allGql.substring(allGql.indexOf('suspend') > -1 ? allGql.indexOf('suspend') - 50 : 0, 300)}"`);
-    }
-
-    const isSuspended = visibleLower.includes(SUSPENSION_PHRASE) ||
-                        allGql.includes('cannot stream at this time') ||
-                        allGql.includes('streamingsuspension') ||
-                        allGql.includes('streaming_suspension');
-
-    console.log(`[${login}] suspended: ${isSuspended}`);
+    console.log(`[${login}] class:${hasClass} text:${hasText} => suspended:${isSuspended} (${html.length} chars)`);
     return { ok: true, isSuspended };
 
   } catch (e) {
@@ -136,20 +105,30 @@ async function runCheck() {
     for (const login of LOGINS) {
       const result = await checkChannel(page, login);
       if (!result.ok) continue;
+
       const prevStatus = state[login] || 'ok';
-      const newStatus = result.isSuspended ? 'suspended' : 'ok';
+      const newStatus  = result.isSuspended ? 'suspended' : 'ok';
 
       if (prevStatus !== 'suspended' && newStatus === 'suspended') {
         console.log(`[${login}] 🚫 SUSPENSION DETECTED`);
-        await sendTelegram(`🚫 <b>${login}</b> — streaming suspension!\ntwitch.tv/${login} — канал виден, но не может вести трансляции.\nВремя: ${new Date().toLocaleString('ru-RU')}`);
+        await sendTelegram(
+          `🚫 <b>${login}</b> — streaming suspension!\n` +
+          `twitch.tv/${login} — канал виден, но не может вести трансляции.\n` +
+          `Время: ${new Date().toLocaleString('ru-RU')}`
+        );
         state[login] = 'suspended';
         saveState(state);
       } else if (prevStatus === 'suspended' && newStatus === 'ok') {
         console.log(`[${login}] ✅ suspension lifted`);
-        await sendTelegram(`✅ <b>${login}</b> — streaming suspension снят!\ntwitch.tv/${login} снова может вести трансляции.\nВремя: ${new Date().toLocaleString('ru-RU')}`);
+        await sendTelegram(
+          `✅ <b>${login}</b> — streaming suspension снят!\n` +
+          `twitch.tv/${login} снова может вести трансляции.\n` +
+          `Время: ${new Date().toLocaleString('ru-RU')}`
+        );
         state[login] = 'ok';
         saveState(state);
       }
+
       await page.waitForTimeout(1000);
     }
     await context.close().catch(() => {});
