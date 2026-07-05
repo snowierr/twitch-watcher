@@ -7,8 +7,6 @@ const CHAT_IDS = (process.env.TELEGRAM_CHAT_IDS || '').split(',').map(s => s.tri
 const INTERVAL_MS = (Number(process.env.CHECK_INTERVAL_MIN) || 1) * 60 * 1000;
 const STATE_FILE = '/tmp/twitch_status.json';
 const SUSPENSION_CLASS = 'home-carousel-info--suspended';
-
-// Режим диагностики — только для drakeoffc, разово
 const DIAG_LOGIN = process.env.DIAG_LOGIN || '';
 
 function loadState() {
@@ -28,19 +26,6 @@ async function sendTelegram(text) {
   }
 }
 
-// Рекурсивно ищем в JSON-объекте ключи содержащие паттерн
-function deepSearch(obj, pattern, path = '', results = []) {
-  if (!obj || typeof obj !== 'object') return results;
-  for (const [k, v] of Object.entries(obj)) {
-    const p = path ? `${path}.${k}` : k;
-    if (pattern.test(k) || (typeof v === 'string' && pattern.test(v))) {
-      results.push(`${p}: ${JSON.stringify(v).substring(0, 120)}`);
-    }
-    if (typeof v === 'object') deepSearch(v, pattern, p, results);
-  }
-  return results;
-}
-
 async function checkChannel(page, login) {
   const isDiag = login === DIAG_LOGIN;
   const gqlResponses = [];
@@ -52,12 +37,12 @@ async function checkChannel(page, login) {
       });
     });
 
-    // Перехватываем GQL ответы
     page.on('response', async (resp) => {
       if (!resp.url().includes('gql.twitch.tv')) return;
       try {
         const json = await resp.json();
-        gqlResponses.push(json);
+        const text = await resp.text().catch(() => '');
+        gqlResponses.push({ json, text, url: resp.url() });
       } catch (e) {}
     });
 
@@ -71,31 +56,32 @@ async function checkChannel(page, login) {
       });
     });
 
-    // Ждём GQL-ответов — не ждём settled, просто даём время
     await page.waitForTimeout(12000);
 
     const html = await page.content();
     const isSuspended = html.includes(SUSPENSION_CLASS);
 
-    console.log(`[${login}] suspended:${isSuspended} gql_responses:${gqlResponses.length} html:${html.length}`);
+    console.log(`[${login}] suspended:${isSuspended} gql:${gqlResponses.length} html:${html.length}`);
 
-    // Диагностика: ищем в GQL-ответах всё связанное с суспендом/стримингом
     if (isDiag) {
-      const pattern = /suspend|ban|stream|enforce|restrict|cannot|offline|carousel/i;
-      const found = [];
-      gqlResponses.forEach((resp, i) => {
-        const hits = deepSearch(resp, pattern);
-        if (hits.length) {
-          found.push(`=== Response #${i} ===`);
-          found.push(...hits.slice(0, 10)); // max 10 хитов на ответ
+      // Ищем операции связанные с каруселью/домашней страницей канала
+      const targetOps = ['HomeOfflineCarousel', 'ChannelShell', 'ChannelRoot', 'ChannelPage', 'OfflineChannel'];
+      gqlResponses.forEach(({ json, text }, i) => {
+        const ops = [];
+        if (Array.isArray(json)) {
+          json.forEach(item => {
+            if (item?.extensions?.operationName) ops.push(item.extensions.operationName);
+          });
+        } else if (json?.extensions?.operationName) {
+          ops.push(json.extensions.operationName);
+        }
+        const isTarget = ops.some(op => targetOps.some(t => op.includes(t)));
+        if (isTarget) {
+          console.log(`[DIAG] Response #${i} ops: ${ops.join(', ')}`);
+          // Выводим JSON полностью (первые 3000 символов)
+          console.log(`[DIAG] Full JSON: ${text.substring(0, 3000)}`);
         }
       });
-      if (found.length) {
-        console.log(`[DIAG ${login}] Found ${found.length} items:`);
-        found.slice(0, 50).forEach(l => console.log(`  ${l}`));
-      } else {
-        console.log(`[DIAG ${login}] Nothing found in ${gqlResponses.length} GQL responses`);
-      }
     }
 
     return { ok: true, isSuspended };
@@ -143,7 +129,7 @@ async function runCheck() {
   finally { if (browser) await browser.close().catch(() => {}); }
 }
 
-if (!BOT_TOKEN || CHAT_IDS.length === 0) { console.error('BOT_TOKEN/CHAT_IDS не заданы'); process.exit(1); }
+if (!BOT_TOKEN || CHAT_IDS.length === 0) { console.error('Не заданы BOT_TOKEN/CHAT_IDS'); process.exit(1); }
 if (LOGINS.length === 0) { console.error('TWITCH_LOGINS не задан'); process.exit(1); }
 console.log(`[start] Мониторим: ${LOGINS.join(', ')} | Интервал: ${INTERVAL_MS/60000} мин`);
 runCheck().then(() => setInterval(runCheck, INTERVAL_MS));
