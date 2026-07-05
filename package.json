@@ -1,13 +1,13 @@
 {
   "name": "twitch-watcher",
   "version": "1.0.0",
-  "description": "Detects Twitch streaming suspensions via headless browser",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js",
-    "install-browsers": "npx playwright install chromium --with-deps"
+    "start": "node index.js"
   },
   "dependencies": {
+    "playwright-extra": "^4.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
     "playwright": "^1.44.0"
   }
 }
