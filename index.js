@@ -1,7 +1,6 @@
 const { chromium } = require('playwright-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 chromium.use(StealthPlugin());
-
 const fs = require('fs');
 
 const LOGINS = (process.env.TWITCH_LOGINS || '').split(',').map(s => s.trim()).filter(Boolean);
@@ -18,32 +17,27 @@ const TWITCH_CLIENT_SECRET = process.env.TWITCH_CLIENT_SECRET || '';
 const INITIAL_TOKEN        = process.env.TWITCH_USER_TOKEN || '';
 const INITIAL_REFRESH      = process.env.TWITCH_USER_REFRESH || '';
 
-// ---------- хранилище состояния ----------
 function loadState() {
   try { return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); } catch (e) { return {}; }
 }
 function saveState(s) {
   try { fs.writeFileSync(STATE_FILE, JSON.stringify(s), 'utf8'); } catch (e) {}
 }
-
-// ---------- токен (с рефрешем) ----------
 function loadToken() {
-  try { return JSON.parse(fs.readFileSync(TOKEN_FILE, 'utf8')); } catch (e) {
-    return { access: INITIAL_TOKEN, refresh: INITIAL_REFRESH };
-  }
+  try { return JSON.parse(fs.readFileSync(TOKEN_FILE, 'utf8')); }
+  catch (e) { return { access: INITIAL_TOKEN, refresh: INITIAL_REFRESH }; }
 }
 function saveToken(t) {
   try { fs.writeFileSync(TOKEN_FILE, JSON.stringify(t), 'utf8'); } catch (e) {}
 }
 
 async function refreshAccessToken() {
+  const t = loadToken();
+  if (!t.refresh) { console.warn('[token] refresh token не задан'); return null; }
   if (!TWITCH_CLIENT_ID || !TWITCH_CLIENT_SECRET) {
-    console.warn('[token] TWITCH_CLIENT_ID/SECRET не заданы — рефреш невозможен');
+    console.warn('[token] CLIENT_ID/SECRET не заданы — рефреш невозможен');
     return null;
   }
-  const t = loadToken();
-  if (!t.refresh) { console.warn('[token] refresh token отсутствует'); return null; }
-
   try {
     const res = await fetch('https://id.twitch.tv/oauth2/token', {
       method: 'POST',
@@ -59,25 +53,38 @@ async function refreshAccessToken() {
     if (data.access_token) {
       const newToken = { access: data.access_token, refresh: data.refresh_token || t.refresh };
       saveToken(newToken);
-      console.log('[token] токен обновлён');
-      return newToken.access;
-    } else {
-      console.error('[token] рефреш не удался:', JSON.stringify(data));
-      return null;
+      console.log('[token] ✅ токен обновлён');
+      return data.access_token;
     }
+    console.error('[token] рефреш не удался:', JSON.stringify(data));
+    return null;
   } catch (e) {
     console.error('[token] ошибка рефреша:', e.message);
     return null;
   }
 }
 
+// Проверяем токен через Twitch API — возвращает true если валиден
+async function validateToken(token) {
+  if (!token) return false;
+  try {
+    const res = await fetch('https://id.twitch.tv/oauth2/validate', {
+      headers: { 'Authorization': 'OAuth ' + token }
+    });
+    return res.status === 200;
+  } catch (e) { return false; }
+}
+
 async function getValidToken() {
-  let t = loadToken();
-  if (t.access) return t.access;
+  const t = loadToken();
+  if (await validateToken(t.access)) {
+    console.log('[token] токен валиден');
+    return t.access;
+  }
+  console.log('[token] токен истёк — запускаю рефреш...');
   return await refreshAccessToken();
 }
 
-// ---------- Telegram ----------
 async function sendTelegram(text) {
   for (const chatId of CHAT_IDS) {
     try {
@@ -89,7 +96,6 @@ async function sendTelegram(text) {
   }
 }
 
-// ---------- проверка канала ----------
 async function checkChannel(page, login) {
   const gqlResponses = [];
   try {
@@ -98,7 +104,6 @@ async function checkChannel(page, login) {
         try { localStorage.setItem(k, JSON.stringify({ analytics:true, ads:true, accepted:true, date:Date.now() })); } catch(e) {}
       });
     });
-
     page.on('response', async (resp) => {
       if (!resp.url().includes('gql.twitch.tv')) return;
       try { gqlResponses.push(await resp.json()); } catch (e) {}
@@ -107,42 +112,36 @@ async function checkChannel(page, login) {
     await page.goto(`https://www.twitch.tv/${login}`, {
       waitUntil: 'domcontentloaded', timeout: 30000
     });
-
     await page.evaluate(() => {
       document.querySelectorAll('button').forEach(btn => {
         if (/decline|reject|accept/i.test(btn.textContent || '')) btn.click();
       });
     });
-
     await page.waitForTimeout(10000);
 
     const html = await page.content();
     const allGql = JSON.stringify(gqlResponses).toLowerCase();
-    const hasIntegrityFailure = allGql.includes('integritycheckfailed') || allGql.includes('failed integrity check');
+    const integrityOk = !allGql.includes('integritycheckfailed') && !allGql.includes('failed integrity check');
     const hasClass = html.includes(SUSPENSION_CLASS);
     const hasText  = html.toLowerCase().includes(SUSPENSION_TEXT);
     const isSuspended = hasClass || hasText;
 
-    // Если integrity всё ещё падает — токен истёк, пробуем рефреш
-    if (hasIntegrityFailure) {
-      return { ok: true, isSuspended, tokenExpired: true };
-    }
-
-    console.log(`[${login}] suspended:${isSuspended} integrity_ok:true gql:${gqlResponses.length} html:${html.length}`);
-    return { ok: true, isSuspended, tokenExpired: false };
+    console.log(`[${login}] suspended:${isSuspended} integrity_ok:${integrityOk} gql:${gqlResponses.length}`);
+    return { ok: true, isSuspended };
   } catch (e) {
     console.error(`[${login}] error: ${e.message}`);
     return { ok: false, isSuspended: false };
   }
 }
 
-// ---------- основной цикл ----------
 async function runCheck() {
   const state = loadState();
-  let token = await getValidToken();
+
+  // Получаем валидный токен ДО запуска браузера
+  const token = await getValidToken();
   if (!token) {
-    console.error('[run] нет действующего токена, пропускаем цикл');
-    return;
+    console.warn('[run] нет валидного токена — работаем без авторизации');
+    await sendTelegram('⚠️ twitch-watcher: Twitch токен истёк и рефреш не удался. Нужна повторная авторизация.');
   }
 
   let browser;
@@ -155,25 +154,18 @@ async function runCheck() {
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
       locale: 'en-US', viewport: { width: 1280, height: 800 }
     });
-
-    await context.addCookies([{
-      name: 'auth-token', value: token,
-      domain: '.twitch.tv', path: '/', secure: true, sameSite: 'Lax'
-    }]);
-
+    if (token) {
+      await context.addCookies([{
+        name: 'auth-token', value: token,
+        domain: '.twitch.tv', path: '/', secure: true, sameSite: 'Lax'
+      }]);
+      console.log('[auth] auth-token cookie установлен');
+    }
     const page = await context.newPage();
-    let needsRefresh = false;
 
     for (const login of LOGINS) {
       const result = await checkChannel(page, login);
       if (!result.ok) continue;
-
-      if (result.tokenExpired) {
-        console.log(`[${login}] integrity failed — токен истёк, нужен рефреш`);
-        needsRefresh = true;
-        continue; // не обновляем статус при невалидном токене
-      }
-
       const prev = state[login] || 'ok';
       const next = result.isSuspended ? 'suspended' : 'ok';
       if (prev !== 'suspended' && next === 'suspended') {
@@ -187,16 +179,7 @@ async function runCheck() {
       }
       await page.waitForTimeout(500);
     }
-
     await context.close().catch(() => {});
-
-    // Если токен истёк — рефрешим и очищаем кеш, чтобы следующий цикл взял новый
-    if (needsRefresh) {
-      const newToken = await refreshAccessToken();
-      if (!newToken) {
-        await sendTelegram('⚠️ twitch-watcher: user token истёк и рефреш не удался. Нужно заново авторизоваться через Apps Script.');
-      }
-    }
   } catch (e) { console.error('[browser]', e.message); }
   finally { if (browser) await browser.close().catch(() => {}); }
 }
