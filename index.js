@@ -6,8 +6,6 @@ const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const CHAT_IDS = (process.env.TELEGRAM_CHAT_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
 const INTERVAL_MS = (Number(process.env.CHECK_INTERVAL_MIN) || 1) * 60 * 1000;
 const STATE_FILE = '/tmp/twitch_status.json';
-
-// Единственная уникальная фраза из баннера суспенда
 const SUSPENSION_PHRASE = 'cannot stream at this time';
 
 function loadState() {
@@ -32,29 +30,78 @@ async function sendTelegram(text) {
   }
 }
 
+// Закрываем баннер куки — пробуем несколько вариантов кнопок
+async function dismissCookieBanner(page) {
+  const selectors = [
+    'button[data-a-target="consent-banner-accept"]',
+    'button[data-a-target="consent-banner-decline"]',
+    'button:has-text("Accept")',
+    'button:has-text("Decline")',
+    'button:has-text("Reject")',
+  ];
+  for (const sel of selectors) {
+    try {
+      const btn = await page.$(sel);
+      if (btn) {
+        await btn.click();
+        console.log(`[cookie] dismissed via: ${sel}`);
+        return true;
+      }
+    } catch (e) {}
+  }
+  return false;
+}
+
 async function checkChannel(page, login) {
   try {
+    // Перехватываем GQL-ответы — это запасной способ обнаружить суспенд
+    const gqlTexts = [];
+    const onResponse = async (response) => {
+      if (response.url().includes('gql.twitch.tv')) {
+        try {
+          const text = await response.text();
+          gqlTexts.push(text);
+        } catch (e) {}
+      }
+    };
+    page.on('response', onResponse);
+
     await page.goto(`https://www.twitch.tv/${login}`, {
       waitUntil: 'domcontentloaded',
       timeout: 30000
     });
 
-    // Ждём пока React отрендерит контент — проверяем что тело выросло до нормального размера
-    await page.waitForFunction(
-      () => document.body.innerText.length > 3000,
-      { timeout: 20000 }
-    ).catch(() => {});
+    // Пробуем закрыть баннер куки
+    const dismissed = await dismissCookieBanner(page);
+    if (dismissed) {
+      // После закрытия баннера ждём загрузки реального контента
+      await page.waitForTimeout(5000);
+    } else {
+      await page.waitForTimeout(3000);
+    }
 
-    // Дополнительные 2 секунды на асинхронные компоненты
-    await page.waitForTimeout(2000);
+    // innerText — только видимый текст, без скриптов и стилей
+    const visibleText = await page.evaluate(() => document.body.innerText).catch(() => '');
+    const visibleLower = visibleText.toLowerCase();
 
-    const bodyText = (await page.textContent('body')).toLowerCase();
+    // Также проверяем все GQL-ответы на случай если текст не попал в DOM
+    const allGql = gqlTexts.join(' ').toLowerCase();
 
-    // ДИАГНОСТИКА: показываем первые 300 символов чтобы понять что реально приходит
-    console.log(`[${login}] body preview: "${bodyText.substring(0, 300).replace(/\s+/g, ' ')}"`);
+    page.off('response', onResponse);
 
-    const isSuspended = bodyText.includes(SUSPENSION_PHRASE);
-    console.log(`[${login}] suspended: ${isSuspended} (body length: ${bodyText.length})`);
+    // Диагностика
+    console.log(`[${login}] visible text (first 300): "${visibleLower.substring(0, 300).replace(/\s+/g, ' ')}"`);
+    console.log(`[${login}] GQL responses: ${gqlTexts.length}, total chars: ${allGql.length}`);
+    if (allGql.includes('suspend') || allGql.includes('cannot stream')) {
+      console.log(`[${login}] GQL preview: "${allGql.substring(allGql.indexOf('suspend') > -1 ? allGql.indexOf('suspend') - 50 : 0, 300)}"`);
+    }
+
+    const isSuspended = visibleLower.includes(SUSPENSION_PHRASE) ||
+                        allGql.includes('cannot stream at this time') ||
+                        allGql.includes('streamingsuspension') ||
+                        allGql.includes('streaming_suspension');
+
+    console.log(`[${login}] suspended: ${isSuspended}`);
     return { ok: true, isSuspended };
 
   } catch (e) {
@@ -65,69 +112,48 @@ async function checkChannel(page, login) {
 
 async function runCheck() {
   if (LOGINS.length === 0) return;
-
   const state = loadState();
   let browser;
-
   try {
     browser = await chromium.launch({
       headless: true,
       args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-blink-features=AutomationControlled',
-        '--window-size=1280,800'
+        '--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage',
+        '--disable-blink-features=AutomationControlled', '--window-size=1280,800'
       ]
     });
-
     const context = await browser.newContext({
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
       locale: 'en-US',
       viewport: { width: 1280, height: 800 },
     });
-
-    // Скрываем признаки автоматизации
     await context.addInitScript(() => {
       Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
       window.chrome = { runtime: {} };
     });
-
     const page = await context.newPage();
 
     for (const login of LOGINS) {
       const result = await checkChannel(page, login);
       if (!result.ok) continue;
-
       const prevStatus = state[login] || 'ok';
       const newStatus = result.isSuspended ? 'suspended' : 'ok';
 
       if (prevStatus !== 'suspended' && newStatus === 'suspended') {
         console.log(`[${login}] 🚫 SUSPENSION DETECTED`);
-        await sendTelegram(
-          `🚫 <b>${login}</b> — streaming suspension!\n` +
-          `twitch.tv/${login} — канал виден, но не может вести трансляции.\n` +
-          `Время: ${new Date().toLocaleString('ru-RU')}`
-        );
+        await sendTelegram(`🚫 <b>${login}</b> — streaming suspension!\ntwitch.tv/${login} — канал виден, но не может вести трансляции.\nВремя: ${new Date().toLocaleString('ru-RU')}`);
         state[login] = 'suspended';
         saveState(state);
       } else if (prevStatus === 'suspended' && newStatus === 'ok') {
         console.log(`[${login}] ✅ suspension lifted`);
-        await sendTelegram(
-          `✅ <b>${login}</b> — streaming suspension снят!\n` +
-          `twitch.tv/${login} снова может вести трансляции.\n` +
-          `Время: ${new Date().toLocaleString('ru-RU')}`
-        );
+        await sendTelegram(`✅ <b>${login}</b> — streaming suspension снят!\ntwitch.tv/${login} снова может вести трансляции.\nВремя: ${new Date().toLocaleString('ru-RU')}`);
         state[login] = 'ok';
         saveState(state);
       }
-
       await page.waitForTimeout(1000);
     }
-
     await context.close().catch(() => {});
   } catch (e) {
-    // Не шлём алерт в телеграм при обычной ошибке браузера — просто логируем
     console.error('[browser] error:', e.message);
   } finally {
     if (browser) await browser.close().catch(() => {});
